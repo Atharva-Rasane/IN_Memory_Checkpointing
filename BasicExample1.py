@@ -1,9 +1,12 @@
 import argparse
 import copy
+import json
 import logging
 import math
 import os
 import shutil
+import time
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
@@ -33,6 +36,13 @@ def positive_float(value):
     value = float(value)
     if value <= 0:
         raise argparse.ArgumentTypeError("value must be greater than zero")
+    return value
+
+
+def nonnegative_int(value):
+    value = int(value)
+    if value < 0:
+        raise argparse.ArgumentTypeError("value must be zero or greater")
     return value
 
 
@@ -95,6 +105,31 @@ def parse_args():
         help="Keep checkpoint files after restore verification",
     )
     parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from the latest checkpoint instead of starting from scratch",
+    )
+    parser.add_argument(
+        "--fail_epoch",
+        default=0,
+        type=nonnegative_int,
+        help=(
+            "Stop the job after this epoch checkpoint is valid; "
+            "0 disables failure injection"
+        ),
+    )
+    parser.add_argument(
+        "--failure_rank",
+        default=0,
+        type=nonnegative_int,
+        help="Global rank assigned the primary injected-failure exit status",
+    )
+    parser.add_argument(
+        "--metrics_dir",
+        default="checkpoint_metrics",
+        help="Directory for per-rank JSONL timing metrics",
+    )
+    parser.add_argument(
         "--replication",
         action="store_true",
         help="Enable local-checkpoint replication on every rank",
@@ -154,6 +189,19 @@ def validate_replication_config(args):
         )
 
 
+def validate_failure_config(args):
+    if args.failure_rank >= dist.get_world_size():
+        raise ValueError(
+            f"failure_rank must be less than world size {dist.get_world_size()}; "
+            f"received {args.failure_rank}."
+        )
+    if args.fail_epoch > args.epochs:
+        raise ValueError(
+            f"fail_epoch must be no greater than epochs ({args.epochs}); "
+            f"received {args.fail_epoch}."
+        )
+
+
 def create_checkpoint_manager(args):
     if args.replication:
         logging.info("Creating CliqueReplicationStrategy.")
@@ -171,6 +219,94 @@ def reset_checkpoint_dir(args):
         logging.info("Resetting local checkpoint directory: %s", args.ckpt_dir)
         shutil.rmtree(args.ckpt_dir, ignore_errors=True)
     dist.barrier()
+
+
+class MetricsRecorder:
+    def __init__(self, metrics_dir):
+        self.path = Path(metrics_dir) / f"rank_{dist.get_rank()}.jsonl"
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def record(self, payload):
+        payload = {
+            "timestamp_unix": time.time(),
+            "rank": dist.get_rank(),
+            "local_rank": int(os.environ["LOCAL_RANK"]),
+            **payload,
+        }
+        with self.path.open("a", encoding="utf-8") as metrics_file:
+            metrics_file.write(json.dumps(payload, sort_keys=True) + "\n")
+
+
+def prepare_metrics(args):
+    if not args.resume and dist.get_node_local_rank() == 0:
+        shutil.rmtree(args.metrics_dir, ignore_errors=True)
+    dist.barrier()
+    return MetricsRecorder(args.metrics_dir)
+
+
+def measure_duration(device, operation):
+    torch.cuda.synchronize(device)
+    started_at = time.perf_counter()
+    result = operation()
+    torch.cuda.synchronize(device)
+    return result, time.perf_counter() - started_at
+
+
+def record_timing(
+    recorder,
+    device,
+    event,
+    epoch,
+    duration_seconds,
+    checkpoint_bytes=None,
+):
+    local_duration = torch.tensor([duration_seconds], dtype=torch.float64, device=device)
+    gathered = [torch.zeros_like(local_duration) for _ in range(dist.get_world_size())]
+    dist.all_gather(gathered, local_duration)
+    durations = [sample.item() for sample in gathered]
+
+    payload = {
+        "event": event,
+        "epoch": epoch,
+        "duration_seconds": duration_seconds,
+        "global_min_seconds": min(durations),
+        "global_mean_seconds": sum(durations) / len(durations),
+        "global_max_seconds": max(durations),
+    }
+    if checkpoint_bytes is not None:
+        checkpoint_megabytes = checkpoint_bytes / (1024**2)
+        payload["checkpoint_bytes"] = checkpoint_bytes
+        payload["checkpoint_megabytes"] = checkpoint_megabytes
+        payload["effective_throughput_mb_per_second"] = (
+            checkpoint_megabytes / max(durations) if max(durations) > 0 else None
+        )
+
+    recorder.record(payload)
+    if dist.get_rank() == 0:
+        size_message = (
+            f" size={checkpoint_bytes / (1024**2):.2f}MiB"
+            if checkpoint_bytes is not None
+            else ""
+        )
+        logging.info(
+            "TIMING event=%s epoch=%s min=%.6fs mean=%.6fs max=%.6fs%s",
+            event,
+            epoch,
+            min(durations),
+            sum(durations) / len(durations),
+            max(durations),
+            size_message,
+        )
+
+
+def checkpoint_size_bytes(value):
+    if isinstance(value, torch.Tensor):
+        return value.numel() * value.element_size()
+    if isinstance(value, dict):
+        return sum(checkpoint_size_bytes(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return sum(checkpoint_size_bytes(item) for item in value)
+    return 0
 
 
 def create_model_and_optimizer(args, device):
@@ -257,14 +393,25 @@ def evaluate(model, batch_size, device):
     return distributed_mean(loss)
 
 
-def build_checkpoint(model, optimizer, epoch, global_step, validation_loss):
+def build_checkpoint(
+    args,
+    model,
+    optimizer,
+    generator,
+    epoch,
+    global_step,
+    validation_loss,
+):
     return {
         "model": copy.deepcopy(model.module.state_dict()),
         "optimizer": copy.deepcopy(optimizer.state_dict()),
+        "generator_state": generator.get_state().to(model.module.fc1.weight.device),
         "epoch": epoch,
         "global_step": global_step,
         "validation_loss": validation_loss,
         "world_size": dist.get_world_size(),
+        "steps_per_epoch": args.steps_per_epoch,
+        "seed": args.seed,
     }
 
 
@@ -294,6 +441,54 @@ def load_checkpoint(ckpt_manager):
     tensor_aware_state, checkpoint_part_id = ckpt_manager.load()
     logging.info("Successfully loaded checkpoint part %s.", checkpoint_part_id)
     return tensor_aware_state.state_dict
+
+
+def restore_training_state(args, checkpoint, model, optimizer, generator):
+    if checkpoint["world_size"] != dist.get_world_size():
+        raise RuntimeError(
+            f"Checkpoint used world size {checkpoint['world_size']}, "
+            f"but this run uses {dist.get_world_size()}."
+        )
+    if checkpoint.get("steps_per_epoch") != args.steps_per_epoch:
+        raise RuntimeError(
+            f"Checkpoint used {checkpoint.get('steps_per_epoch')} steps per epoch, "
+            f"but this run requested {args.steps_per_epoch}."
+        )
+    if checkpoint.get("seed") != args.seed:
+        raise RuntimeError(
+            f"Checkpoint used seed {checkpoint.get('seed')}, but this run requested {args.seed}."
+        )
+
+    model.module.load_state_dict(checkpoint["model"])
+    optimizer.load_state_dict(checkpoint["optimizer"])
+    generator.set_state(checkpoint["generator_state"].cpu())
+    return checkpoint["epoch"] + 1, checkpoint["global_step"]
+
+
+def inject_failure(args, epoch):
+    if args.fail_epoch != epoch:
+        return
+
+    dist.barrier()
+    rank = dist.get_rank()
+    if rank == args.failure_rank:
+        logging.error(
+            "Injecting requested failure on rank %d after epoch %d checkpoint finalized.",
+            args.failure_rank,
+            epoch,
+        )
+        exit_code = 42
+    else:
+        logging.error(
+            "Stopping rank %d after rank %d's requested failure at epoch %d.",
+            rank,
+            args.failure_rank,
+            epoch,
+        )
+        exit_code = 43
+
+    logging.shutdown()
+    os._exit(exit_code)
 
 
 def verify_restored_checkpoint(args, checkpoint, expected_validation_loss, device):
@@ -362,6 +557,30 @@ def cleanup_checkpoints(args):
     dist.barrier()
 
 
+def finalize_pending_async(async_queue, pending, recorder, device):
+    _, finalize_duration = measure_duration(
+        device,
+        lambda: finalize_async_save(async_queue, pending["epoch"]),
+    )
+    end_to_end_duration = time.perf_counter() - pending["started_at"]
+    record_timing(
+        recorder,
+        device,
+        "checkpoint_async_finalize",
+        pending["epoch"],
+        finalize_duration,
+        pending["checkpoint_bytes"],
+    )
+    record_timing(
+        recorder,
+        device,
+        "checkpoint_async_end_to_end",
+        pending["epoch"],
+        end_to_end_duration,
+        pending["checkpoint_bytes"],
+    )
+
+
 def main():
     args = parse_args()
     logging.info("%s", args)
@@ -371,7 +590,12 @@ def main():
 
     try:
         validate_replication_config(args)
-        reset_checkpoint_dir(args)
+        validate_failure_config(args)
+        metrics = prepare_metrics(args)
+        if args.resume:
+            logging.info("Preserving checkpoint directory for resume: %s", args.ckpt_dir)
+        else:
+            reset_checkpoint_dir(args)
 
         torch.manual_seed(args.seed)
         torch.cuda.manual_seed_all(args.seed)
@@ -382,34 +606,73 @@ def main():
             output_device=device.index,
         )
 
-        if dist.get_rank() == 0:
-            logging.info(
-                "Starting %d training epochs with %d ranks and a global batch size of %d.",
-                args.epochs,
-                dist.get_world_size(),
-                args.batch_size * dist.get_world_size(),
-            )
-
         ckpt_manager = create_checkpoint_manager(args)
         if args.async_save:
             async_queue = AsyncCallsQueue(persistent=False)
 
         generator = torch.Generator(device=device)
         generator.manual_seed(args.seed + dist.get_rank())
+        start_epoch = 1
+        global_step = 0
+        if args.resume:
+            restored_checkpoint, load_duration = measure_duration(
+                device,
+                lambda: load_checkpoint(ckpt_manager),
+            )
+            record_timing(
+                metrics,
+                device,
+                "checkpoint_resume_load",
+                restored_checkpoint["epoch"],
+                load_duration,
+                checkpoint_size_bytes(restored_checkpoint),
+            )
+            start_epoch, global_step = restore_training_state(
+                args,
+                restored_checkpoint,
+                model,
+                optimizer,
+                generator,
+            )
+            if start_epoch > args.epochs:
+                raise RuntimeError(
+                    f"Checkpoint epoch {restored_checkpoint['epoch']} already reaches "
+                    f"the requested {args.epochs} epochs."
+                )
+            if dist.get_rank() == 0:
+                logging.info(
+                    "Resuming from epoch %d at global step %d; next epoch is %d.",
+                    restored_checkpoint["epoch"],
+                    global_step,
+                    start_epoch,
+                )
+
+        if dist.get_rank() == 0:
+            logging.info(
+                "Training through epoch %d with %d ranks and a global batch size of %d.",
+                args.epochs,
+                dist.get_world_size(),
+                args.batch_size * dist.get_world_size(),
+            )
+
         initial_loss = None
         final_loss = None
         validation_loss = None
-        pending_async_epoch = None
+        pending_async = None
 
-        for epoch in range(1, args.epochs + 1):
-            epoch_initial_loss, final_loss = train_epoch(
-                args,
-                epoch,
-                model,
-                optimizer,
+        for epoch in range(start_epoch, args.epochs + 1):
+            (epoch_initial_loss, final_loss), train_duration = measure_duration(
                 device,
-                generator,
+                lambda: train_epoch(
+                    args,
+                    epoch,
+                    model,
+                    optimizer,
+                    device,
+                    generator,
+                ),
             )
+            record_timing(metrics, device, "epoch_training", epoch, train_duration)
             if initial_loss is None:
                 initial_loss = epoch_initial_loss
 
@@ -422,23 +685,69 @@ def main():
                     validation_loss,
                 )
 
-            if pending_async_epoch is not None:
-                finalize_async_save(async_queue, pending_async_epoch)
-                pending_async_epoch = None
+            if pending_async is not None:
+                finalize_pending_async(async_queue, pending_async, metrics, device)
+                pending_async = None
 
-            checkpoint = build_checkpoint(
-                model,
-                optimizer,
-                epoch,
-                epoch * args.steps_per_epoch,
-                validation_loss,
+            global_step += args.steps_per_epoch
+            checkpoint, snapshot_duration = measure_duration(
+                device,
+                lambda: build_checkpoint(
+                    args,
+                    model,
+                    optimizer,
+                    generator,
+                    epoch,
+                    global_step,
+                    validation_loss,
+                ),
             )
-            save_checkpoint(args, ckpt_manager, async_queue, checkpoint, epoch)
-            if args.async_save:
-                pending_async_epoch = epoch
+            checkpoint_bytes = checkpoint_size_bytes(checkpoint)
+            record_timing(
+                metrics,
+                device,
+                "checkpoint_snapshot",
+                epoch,
+                snapshot_duration,
+                checkpoint_bytes,
+            )
 
-        if pending_async_epoch is not None:
-            finalize_async_save(async_queue, pending_async_epoch)
+            async_started_at = time.perf_counter()
+            _, save_duration = measure_duration(
+                device,
+                lambda: save_checkpoint(
+                    args,
+                    ckpt_manager,
+                    async_queue,
+                    checkpoint,
+                    epoch,
+                ),
+            )
+            save_event = (
+                "checkpoint_async_submit" if args.async_save else "checkpoint_save"
+            )
+            record_timing(
+                metrics,
+                device,
+                save_event,
+                epoch,
+                save_duration,
+                checkpoint_bytes,
+            )
+            if args.async_save:
+                pending_async = {
+                    "epoch": epoch,
+                    "started_at": async_started_at,
+                    "checkpoint_bytes": checkpoint_bytes,
+                }
+
+            if args.fail_epoch == epoch and pending_async is not None:
+                finalize_pending_async(async_queue, pending_async, metrics, device)
+                pending_async = None
+            inject_failure(args, epoch)
+
+        if pending_async is not None:
+            finalize_pending_async(async_queue, pending_async, metrics, device)
 
         if dist.get_rank() == 0:
             logging.info(
@@ -450,7 +759,18 @@ def main():
             )
 
         dist.barrier()
-        restored_checkpoint = load_checkpoint(ckpt_manager)
+        restored_checkpoint, load_duration = measure_duration(
+            device,
+            lambda: load_checkpoint(ckpt_manager),
+        )
+        record_timing(
+            metrics,
+            device,
+            "checkpoint_verification_load",
+            restored_checkpoint["epoch"],
+            load_duration,
+            checkpoint_size_bytes(restored_checkpoint),
+        )
         verify_restored_checkpoint(args, restored_checkpoint, validation_loss, device)
         cleanup_checkpoints(args)
     finally:

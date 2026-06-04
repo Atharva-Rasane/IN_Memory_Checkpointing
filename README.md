@@ -159,11 +159,12 @@ Then start node 1 with the same command:
 Node 0 waits until node 1 joins. Both nodes use
 `/mnt/checkpoint-ram/basic-example` automatically.
 
-Each run starts from scratch and clears its configured local checkpoint
-directory on both VMs before training. The default run performs five epochs
-with 20 distributed steps per epoch. Each rank processes a different synthetic
-batch, DDP synchronizes gradients between both GPUs, and rank 0 logs the global
-mean training loss.
+A normal run starts from scratch and clears its configured local checkpoint
+directory on both VMs before training. A run with `--resume` preserves the
+directory and restores the latest checkpoint. The default run performs five
+epochs with 20 distributed steps per epoch. Each rank processes a different
+synthetic batch, DDP synchronizes gradients between both GPUs, and rank 0 logs
+the global mean training loss.
 
 At the end of every epoch, the example:
 
@@ -204,6 +205,65 @@ Run a longer training test by passing the same arguments on both VMs:
   --replication_factor 2
 ```
 
+## Measure Checkpoint Time and Test Recovery
+
+The example measures checkpoint snapshot, save, finalize, and load operations
+with CUDA synchronization so the reported wall-clock times include completed
+GPU work. Rank 0 logs the global minimum, mean, and maximum duration across all
+ranks. Every rank also appends structured metrics to:
+
+```text
+checkpoint_metrics/rank_<global-rank>.jsonl
+```
+
+These metrics are outside the RAM checkpoint directory, so they remain after a
+successful run cleans up checkpoints and after an injected failure.
+
+To simulate a failure after epoch 5 while training through epoch 10, run this
+same command on both VMs:
+
+```bash
+./launch.sh \
+  --epochs 10 \
+  --steps_per_epoch 100 \
+  --fail_epoch 5 \
+  --failure_rank 0 \
+  --keep_checkpoints \
+  --replication \
+  --replication_jump 1 \
+  --replication_factor 2
+```
+
+The selected rank exits with status `42` only after every rank has finalized
+the epoch-5 checkpoint. Peer ranks exit with status `43` at the same point so
+no distributed workers remain blocked. The first launch is therefore expected
+to fail.
+
+Inspect the retained epoch-5 checkpoint and timing metrics on each VM:
+
+```bash
+find /mnt/checkpoint-ram/basic-example -type f -ls
+cat checkpoint_metrics/rank_*.jsonl
+```
+
+Then run this same recovery command on both VMs:
+
+```bash
+./launch.sh \
+  --resume \
+  --epochs 10 \
+  --steps_per_epoch 100 \
+  --keep_checkpoints \
+  --replication \
+  --replication_jump 1 \
+  --replication_factor 2
+```
+
+The recovery launch loads epoch 5, restores the model, optimizer, random-data
+generator, and global step, then starts training at epoch 6. Do not reboot the
+VMs between failure and recovery because the checkpoints are stored in
+volatile `tmpfs`.
+
 ## Run on One VM
 
 Prepare a single VM with:
@@ -240,14 +300,18 @@ submitted.
 --seed VALUE               Base random seed; default: 1234
 --async_save               Save each epoch checkpoint asynchronously
 --keep_checkpoints         Do not remove checkpoint files after verification
+--resume                   Resume from the latest checkpoint
+--fail_epoch EPOCH         Fail after this epoch checkpoint is valid; 0 disables
+--failure_rank RANK        Global rank that reports the primary failure
+--metrics_dir DIRECTORY    Per-rank JSONL timing directory
 ```
 
 The effective global batch size is `batch_size * total ranks`. Pass identical
 training and checkpoint arguments on every VM.
 
 `--keep_checkpoints` leaves the files available for inspection after the run.
-Only the latest valid epoch is retained. The next run clears the configured
-checkpoint directory before training.
+Only the latest valid epoch is retained. The next normal run clears the
+configured checkpoint directory before training; `--resume` preserves it.
 
 ## Setup Options
 
