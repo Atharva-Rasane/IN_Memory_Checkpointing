@@ -2,3 +2,6 @@
 
 torch==2.11.0+cu128
 nvidia-resiliency-ext==0.6.0
+transformers>=4.57,<5
+datasets>=2.20,<5
+sentencepiece>=0.2,<0.3

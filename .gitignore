@@ -3,3 +3,4 @@
 __pycache__/
 *.py[cod]
 checkpoint_metrics/
+LLM examples/arnir0/Tiny-LLM/logs/

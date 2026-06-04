@@ -288,6 +288,49 @@ With `--async_save`, each epoch's RAM checkpoint write overlaps the following
 epoch's training. It is finalized before the next epoch checkpoint is
 submitted.
 
+## Tiny LLM Example
+
+The `LLM examples/arnir0/Tiny-LLM` folder contains a separate Hugging Face
+fine-tuning example for `arnir0/Tiny-LLM` on WikiText-2. It uses the same
+two-VM `.cluster.env` values from `setup.sh`, but writes checkpoints to
+`/mnt/checkpoint-ram/tiny-llm` by default.
+
+Install the extra dependencies on both VMs after pulling this repository:
+
+```bash
+.venv/bin/python -m pip install -r requirements.txt
+```
+
+Run from `LLM examples/arnir0/Tiny-LLM` on both VMs:
+
+```bash
+./launch.sh \
+  --epochs 10 \
+  --steps_per_epoch 10 \
+  --checkpoint_interval_steps 1 \
+  --replication \
+  --replication_jump 1 \
+  --replication_factor 2
+```
+
+Run the supervised failure test with two injected failures, then automatic
+resume attempts:
+
+```bash
+python3 health_worker.py -- \
+  --keep_checkpoints \
+  --replication \
+  --replication_jump 1 \
+  --replication_factor 2
+```
+
+The worker defaults to 10 epochs and fails after epochs 3 and 7. It restarts
+with `--resume` after each failed attempt. Aggregate local rank metrics with:
+
+```bash
+python3 logs_collector.py
+```
+
 ## Training Options
 
 ```text
