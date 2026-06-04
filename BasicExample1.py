@@ -47,10 +47,18 @@ def parse_args():
         help="Checkpoint directory for local checkpoints",
     )
     parser.add_argument(
-        "--steps",
-        default=100,
+        "--epochs",
+        default=5,
         type=positive_int,
-        help="Number of distributed training steps",
+        help="Number of distributed training epochs",
+    )
+    parser.add_argument(
+        "--steps_per_epoch",
+        "--steps",
+        dest="steps_per_epoch",
+        default=20,
+        type=positive_int,
+        help="Distributed training steps in each epoch",
     )
     parser.add_argument(
         "--batch_size",
@@ -79,7 +87,7 @@ def parse_args():
     parser.add_argument(
         "--async_save",
         action="store_true",
-        help="Save the final checkpoint asynchronously",
+        help="Save each epoch checkpoint asynchronously",
     )
     parser.add_argument(
         "--keep_checkpoints",
@@ -194,15 +202,12 @@ def distributed_mean(value):
     return result.item()
 
 
-def train(args, model, optimizer, device):
+def train_epoch(args, epoch, model, optimizer, device, generator):
     loss_fn = nn.MSELoss()
-    generator = torch.Generator(device=device)
-    generator.manual_seed(args.seed + dist.get_rank())
+    first_loss = None
+    last_loss = None
 
-    initial_loss = None
-    final_loss = None
-
-    for step in range(1, args.steps + 1):
+    for step in range(1, args.steps_per_epoch + 1):
         inputs = torch.randn(
             args.batch_size,
             10,
@@ -217,19 +222,25 @@ def train(args, model, optimizer, device):
         loss.backward()
         optimizer.step()
 
-        if step == 1 or step % args.log_interval == 0 or step == args.steps:
-            final_loss = distributed_mean(loss)
-            if initial_loss is None:
-                initial_loss = final_loss
+        if (
+            step == 1
+            or step % args.log_interval == 0
+            or step == args.steps_per_epoch
+        ):
+            last_loss = distributed_mean(loss)
+            if first_loss is None:
+                first_loss = last_loss
             if dist.get_rank() == 0:
                 logging.info(
-                    "Training step %d/%d, global mean loss: %.6f",
+                    "Epoch %d/%d, step %d/%d, global mean loss: %.6f",
+                    epoch,
+                    args.epochs,
                     step,
-                    args.steps,
-                    final_loss,
+                    args.steps_per_epoch,
+                    last_loss,
                 )
 
-    return initial_loss, final_loss
+    return first_loss, last_loss
 
 
 @torch.no_grad()
@@ -246,32 +257,38 @@ def evaluate(model, batch_size, device):
     return distributed_mean(loss)
 
 
-def build_checkpoint(model, optimizer, step, validation_loss):
+def build_checkpoint(model, optimizer, epoch, global_step, validation_loss):
     return {
         "model": copy.deepcopy(model.module.state_dict()),
         "optimizer": copy.deepcopy(optimizer.state_dict()),
-        "step": step,
+        "epoch": epoch,
+        "global_step": global_step,
         "validation_loss": validation_loss,
         "world_size": dist.get_world_size(),
     }
 
 
-def save_checkpoint(args, ckpt_manager, async_queue, checkpoint, step):
+def save_checkpoint(args, ckpt_manager, async_queue, checkpoint, epoch):
     tensor_aware_state = BasicTensorAwareStateDict(checkpoint)
 
     if args.async_save:
-        logging.info("Creating asynchronous save request.")
-        save_request = ckpt_manager.save(tensor_aware_state, step, is_async=True)
+        logging.info("Creating asynchronous RAM checkpoint for epoch %d.", epoch)
+        save_request = ckpt_manager.save(tensor_aware_state, epoch, is_async=True)
         async_queue.schedule_async_request(save_request)
     else:
-        logging.info("Saving final training checkpoint.")
-        ckpt_manager.save(tensor_aware_state, step)
+        logging.info("Saving RAM checkpoint for epoch %d.", epoch)
+        ckpt_manager.save(tensor_aware_state, epoch)
+
+
+def finalize_async_save(async_queue, epoch):
+    logging.info("Finalizing asynchronous RAM checkpoint for epoch %d.", epoch)
+    async_queue.maybe_finalize_async_calls(blocking=True, no_dist=False)
 
 
 def load_checkpoint(ckpt_manager):
     logging.info("Loading latest training checkpoint.")
-    step = ckpt_manager.find_latest()
-    if step == -1:
+    epoch = ckpt_manager.find_latest()
+    if epoch == -1:
         raise RuntimeError("Local checkpoint has not been found")
 
     tensor_aware_state, checkpoint_part_id = ckpt_manager.load()
@@ -280,9 +297,15 @@ def load_checkpoint(ckpt_manager):
 
 
 def verify_restored_checkpoint(args, checkpoint, expected_validation_loss, device):
-    if checkpoint["step"] != args.steps:
+    if checkpoint["epoch"] != args.epochs:
         raise RuntimeError(
-            f"Expected checkpoint step {args.steps}, loaded {checkpoint['step']}."
+            f"Expected checkpoint epoch {args.epochs}, loaded {checkpoint['epoch']}."
+        )
+    expected_global_step = args.epochs * args.steps_per_epoch
+    if checkpoint["global_step"] != expected_global_step:
+        raise RuntimeError(
+            f"Expected global step {expected_global_step}, "
+            f"loaded {checkpoint['global_step']}."
         )
     if checkpoint["world_size"] != dist.get_world_size():
         raise RuntimeError(
@@ -323,8 +346,10 @@ def verify_restored_checkpoint(args, checkpoint, expected_validation_loss, devic
 
     if dist.get_rank() == 0:
         logging.info(
-            "Checkpoint restore verified at step %d with validation loss %.6f.",
-            checkpoint["step"],
+            "Checkpoint restore verified at epoch %d, global step %d, "
+            "with validation loss %.6f.",
+            checkpoint["epoch"],
+            checkpoint["global_step"],
             restored_validation_loss,
         )
 
@@ -359,39 +384,70 @@ def main():
 
         if dist.get_rank() == 0:
             logging.info(
-                "Starting distributed training with %d ranks and a global batch size of %d.",
+                "Starting %d training epochs with %d ranks and a global batch size of %d.",
+                args.epochs,
                 dist.get_world_size(),
                 args.batch_size * dist.get_world_size(),
-            )
-
-        initial_loss, final_loss = train(args, model, optimizer, device)
-        validation_loss = evaluate(model, args.batch_size, device)
-
-        if dist.get_rank() == 0:
-            logging.info(
-                "Training complete. Loss changed from %.6f to %.6f; "
-                "validation loss: %.6f.",
-                initial_loss,
-                final_loss,
-                validation_loss,
             )
 
         ckpt_manager = create_checkpoint_manager(args)
         if args.async_save:
             async_queue = AsyncCallsQueue(persistent=False)
 
-        checkpoint = build_checkpoint(model, optimizer, args.steps, validation_loss)
-        save_checkpoint(
-            args,
-            ckpt_manager,
-            async_queue,
-            checkpoint,
-            args.steps,
-        )
+        generator = torch.Generator(device=device)
+        generator.manual_seed(args.seed + dist.get_rank())
+        initial_loss = None
+        final_loss = None
+        validation_loss = None
+        pending_async_epoch = None
 
-        if args.async_save:
-            logging.info("Finalizing asynchronous checkpoint save.")
-            async_queue.maybe_finalize_async_calls(blocking=True, no_dist=False)
+        for epoch in range(1, args.epochs + 1):
+            epoch_initial_loss, final_loss = train_epoch(
+                args,
+                epoch,
+                model,
+                optimizer,
+                device,
+                generator,
+            )
+            if initial_loss is None:
+                initial_loss = epoch_initial_loss
+
+            validation_loss = evaluate(model, args.batch_size, device)
+            if dist.get_rank() == 0:
+                logging.info(
+                    "Epoch %d/%d complete; validation loss: %.6f.",
+                    epoch,
+                    args.epochs,
+                    validation_loss,
+                )
+
+            if pending_async_epoch is not None:
+                finalize_async_save(async_queue, pending_async_epoch)
+                pending_async_epoch = None
+
+            checkpoint = build_checkpoint(
+                model,
+                optimizer,
+                epoch,
+                epoch * args.steps_per_epoch,
+                validation_loss,
+            )
+            save_checkpoint(args, ckpt_manager, async_queue, checkpoint, epoch)
+            if args.async_save:
+                pending_async_epoch = epoch
+
+        if pending_async_epoch is not None:
+            finalize_async_save(async_queue, pending_async_epoch)
+
+        if dist.get_rank() == 0:
+            logging.info(
+                "Training complete. Loss changed from %.6f to %.6f; "
+                "final validation loss: %.6f.",
+                initial_loss,
+                final_loss,
+                validation_loss,
+            )
 
         dist.barrier()
         restored_checkpoint = load_checkpoint(ckpt_manager)

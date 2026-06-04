@@ -160,15 +160,22 @@ Node 0 waits until node 1 joins. Both nodes use
 `/mnt/checkpoint-ram/basic-example` automatically.
 
 Each run starts from scratch and clears its configured local checkpoint
-directory on both VMs before training. The default run performs 100 distributed
-training steps. Each rank processes a different synthetic batch, DDP
-synchronizes gradients between both GPUs, and rank 0 logs the global mean
-training loss. At the end, the example:
+directory on both VMs before training. The default run performs five epochs
+with 20 distributed steps per epoch. Each rank processes a different synthetic
+batch, DDP synchronizes gradients between both GPUs, and rank 0 logs the global
+mean training loss.
 
-1. Saves the trained model and optimizer state.
+At the end of every epoch, the example:
+
+1. Saves the trained model and optimizer state to the RAM-backed checkpoint
+   directory.
 2. Replicates each checkpoint part between the two VMs.
-3. Loads the latest checkpoint into a new model and optimizer.
-4. Verifies that the restored model has the same validation loss.
+3. Validates the new epoch checkpoint and removes the older checkpoint.
+
+After the final epoch, the example loads the latest checkpoint into a new model
+and optimizer and verifies that the restored model has the same validation
+loss. NVIDIA's local checkpoint manager retains the latest valid epoch rather
+than every historical epoch.
 
 To make the checkpoint path explicit, the equivalent command on both VMs is:
 
@@ -188,9 +195,10 @@ Run a longer training test by passing the same arguments on both VMs:
 
 ```bash
 ./launch.sh \
-  --steps 1000 \
+  --epochs 20 \
+  --steps_per_epoch 100 \
   --batch_size 1024 \
-  --log_interval 50 \
+  --log_interval 25 \
   --replication \
   --replication_jump 1 \
   --replication_factor 2
@@ -216,15 +224,21 @@ Run the asynchronous-save path:
 ./launch.sh --async_save
 ```
 
+With `--async_save`, each epoch's RAM checkpoint write overlaps the following
+epoch's training. It is finalized before the next epoch checkpoint is
+submitted.
+
 ## Training Options
 
 ```text
---steps COUNT              Distributed training steps; default: 100
+--epochs COUNT             Distributed training epochs; default: 5
+--steps_per_epoch COUNT    Distributed steps in each epoch; default: 20
+--steps COUNT              Alias for --steps_per_epoch
 --batch_size COUNT         Samples processed by each rank per step; default: 256
 --learning_rate RATE       SGD learning rate; default: 0.05
 --log_interval COUNT       Steps between global loss messages; default: 10
 --seed VALUE               Base random seed; default: 1234
---async_save               Save the final checkpoint asynchronously
+--async_save               Save each epoch checkpoint asynchronously
 --keep_checkpoints         Do not remove checkpoint files after verification
 ```
 
@@ -232,7 +246,8 @@ The effective global batch size is `batch_size * total ranks`. Pass identical
 training and checkpoint arguments on every VM.
 
 `--keep_checkpoints` leaves the files available for inspection after the run.
-The next run clears the configured checkpoint directory before training.
+Only the latest valid epoch is retained. The next run clears the configured
+checkpoint directory before training.
 
 ## Setup Options
 
