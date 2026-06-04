@@ -145,6 +145,34 @@ def next_position(checkpoint):
     return epoch, step
 
 
+def move_tensors_to_device(value, device):
+    if isinstance(value, torch.Tensor):
+        return value.to(device)
+    if isinstance(value, dict):
+        return {key: move_tensors_to_device(item, device) for key, item in value.items()}
+    if isinstance(value, list):
+        return [move_tensors_to_device(item, device) for item in value]
+    if isinstance(value, tuple):
+        return tuple(move_tensors_to_device(item, device) for item in value)
+    return value
+
+
+def assert_checkpoint_tensors_cuda(value, path="checkpoint"):
+    if isinstance(value, torch.Tensor):
+        if not value.is_cuda:
+            raise RuntimeError(
+                f"{path} is on {value.device}; NVRx local checkpoints require "
+                "all tensor values to be CUDA tensors."
+            )
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            assert_checkpoint_tensors_cuda(item, f"{path}.{key}")
+    elif isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            assert_checkpoint_tensors_cuda(item, f"{path}[{index}]")
+
+
 def build_training_checkpoint(
     args,
     model,
@@ -155,7 +183,7 @@ def build_training_checkpoint(
     loss_value,
     device,
 ):
-    return {
+    checkpoint = {
         "model": copy.deepcopy(model.module.state_dict()),
         "optimizer": copy.deepcopy(optimizer.state_dict()),
         "torch_rng_state": torch.get_rng_state().to(device),
@@ -168,6 +196,7 @@ def build_training_checkpoint(
         "steps_per_epoch": args.steps_per_epoch,
         "seed": args.seed,
     }
+    return move_tensors_to_device(checkpoint, device)
 
 
 def restore_training_state(args, checkpoint, model, optimizer, device):
@@ -220,6 +249,7 @@ def save_training_checkpoint(
         ),
     )
     checkpoint_bytes = checkpoint_size_bytes(checkpoint)
+    assert_checkpoint_tensors_cuda(checkpoint)
     record_timing(
         recorder,
         device,
