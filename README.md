@@ -1,8 +1,9 @@
 # In-Memory Checkpointing
 
-This repository runs NVIDIA Resiliency Extension's local-checkpointing basic
-example with PyTorch Distributed and NCCL. The example requires NVIDIA GPUs and
-does not run on CPU-only VMs.
+This repository runs a small distributed training workload with PyTorch
+DistributedDataParallel, NCCL, and NVIDIA Resiliency Extension local
+checkpointing. The example requires NVIDIA GPUs and does not run on CPU-only
+VMs.
 
 The intended test environment is two Ubuntu 24.04 VMs with one NVIDIA GPU each.
 `setup.sh` prepares each VM, and `launch.sh` starts the distributed test.
@@ -158,6 +159,17 @@ Then start node 1 with the same command:
 Node 0 waits until node 1 joins. Both nodes use
 `/mnt/checkpoint-ram/basic-example` automatically.
 
+Each run starts from scratch and clears its configured local checkpoint
+directory on both VMs before training. The default run performs 100 distributed
+training steps. Each rank processes a different synthetic batch, DDP
+synchronizes gradients between both GPUs, and rank 0 logs the global mean
+training loss. At the end, the example:
+
+1. Saves the trained model and optimizer state.
+2. Replicates each checkpoint part between the two VMs.
+3. Loads the latest checkpoint into a new model and optimizer.
+4. Verifies that the restored model has the same validation loss.
+
 To make the checkpoint path explicit, the equivalent command on both VMs is:
 
 ```bash
@@ -171,6 +183,18 @@ To make the checkpoint path explicit, the equivalent command on both VMs is:
 After every rank finishes loading, local rank 0 on each VM removes that VM's
 checkpoint directory. Repeated test runs therefore start with an empty
 checkpoint path.
+
+Run a longer training test by passing the same arguments on both VMs:
+
+```bash
+./launch.sh \
+  --steps 1000 \
+  --batch_size 1024 \
+  --log_interval 50 \
+  --replication \
+  --replication_jump 1 \
+  --replication_factor 2
+```
 
 ## Run on One VM
 
@@ -191,6 +215,24 @@ Run the asynchronous-save path:
 ```bash
 ./launch.sh --async_save
 ```
+
+## Training Options
+
+```text
+--steps COUNT              Distributed training steps; default: 100
+--batch_size COUNT         Samples processed by each rank per step; default: 256
+--learning_rate RATE       SGD learning rate; default: 0.05
+--log_interval COUNT       Steps between global loss messages; default: 10
+--seed VALUE               Base random seed; default: 1234
+--async_save               Save the final checkpoint asynchronously
+--keep_checkpoints         Do not remove checkpoint files after verification
+```
+
+The effective global batch size is `batch_size * total ranks`. Pass identical
+training and checkpoint arguments on every VM.
+
+`--keep_checkpoints` leaves the files available for inspection after the run.
+The next run clears the configured checkpoint directory before training.
 
 ## Setup Options
 
