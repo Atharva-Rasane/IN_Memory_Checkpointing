@@ -25,6 +25,31 @@ def read_metrics(metrics_dir):
     return records
 
 
+def print_table(headers, rows):
+    widths = [len(header) for header in headers]
+    for row in rows:
+        for index, value in enumerate(row):
+            widths[index] = max(widths[index], len(str(value)))
+
+    border = "+-" + "-+-".join("-" * width for width in widths) + "-+"
+    header_line = "| " + " | ".join(
+        header.ljust(widths[index]) for index, header in enumerate(headers)
+    ) + " |"
+
+    print(border)
+    print(header_line)
+    print(border)
+    for row in rows:
+        print(
+            "| "
+            + " | ".join(
+                str(value).ljust(widths[index]) for index, value in enumerate(row)
+            )
+            + " |"
+        )
+    print(border)
+
+
 def duration_summary(records):
     by_event = defaultdict(list)
     for record in records:
@@ -35,12 +60,19 @@ def duration_summary(records):
 
 def print_duration_table(by_event):
     print("Measured Timings")
-    print("event,count,min_s,median_s,mean_s,max_s")
+    rows = []
     for event, values in sorted(by_event.items()):
-        print(
-            f"{event},{len(values)},{min(values):.6f},"
-            f"{median(values):.6f},{mean(values):.6f},{max(values):.6f}"
+        rows.append(
+            [
+                event,
+                len(values),
+                f"{min(values):.6f}",
+                f"{median(values):.6f}",
+                f"{mean(values):.6f}",
+                f"{max(values):.6f}",
+            ]
         )
+    print_table(["event", "count", "min_s", "median_s", "mean_s", "max_s"], rows)
 
 
 def sum_event(by_event, names):
@@ -94,31 +126,44 @@ def print_evaluation_mapping(records, by_event):
 
     wasted_gaps = failure_to_resume_gaps(records)
 
+    rows = [
+        ["Iteration Time", f"{iteration_time:.6f}s total measured compute work"],
+        ["Network Idle Time", "not measured; use Nsight Systems/NCCL traces"],
+    ]
+    if not wasted_gaps:
+        rows.append(["Wasted Time After Failure", "not available in this log set"])
+    else:
+        rows.append(
+            [
+                "Wasted Time After Failure",
+                f"{sum(wasted_gaps):.6f}s total failure-to-resume gap",
+            ]
+        )
+    rows.extend(
+        [
+            ["Checkpoint Time", f"{checkpoint_time:.6f}s total measured checkpoint work"],
+            ["Checkpoint Frequency", f"{checkpoint_count} checkpoint writes/submissions"],
+            ["Injected Failures", f"{count_event(records, 'failure_injected')} events"],
+            ["Failure Recovery Probability", "not measured; requires many failure trials"],
+        ]
+    )
+    if effective_ratio is None:
+        rows.append(["Effective Training Time Ratio", "not available"])
+    else:
+        rows.append(["Effective Training Time Ratio", f"{effective_ratio:.6f}"])
+    rows.extend(
+        [
+            ["Scalability with Cluster Size", "not measured; compare cluster sizes"],
+            ["Traffic Interleaving Effectiveness", "compare sync and --async_save runs"],
+            ["Checkpoint Serialization Overhead", "checkpoint_snapshot approximates it"],
+            ["Failure Detection Time", "not measured by this local worker"],
+            ["Recovery Startup/Warmup Time", "use checkpoint_resume_load/resume_loaded"],
+        ]
+    )
+
     print()
     print("Evaluation Metric Mapping")
-    print("metric,result")
-    print(f"Iteration Time,{iteration_time:.6f}s total measured compute work")
-    print("Network Idle Time,not measured; use Nsight Systems/NCCL traces")
-    if not wasted_gaps:
-        print("Wasted Time After Failure,not available in this log set")
-    else:
-        print(
-            "Wasted Time After Failure,"
-            f"{sum(wasted_gaps):.6f}s total failure-to-resume gap"
-        )
-    print(f"Checkpoint Time,{checkpoint_time:.6f}s total measured checkpoint work")
-    print(f"Checkpoint Frequency,{checkpoint_count} checkpoint writes/submissions")
-    print(f"Injected Failures,{count_event(records, 'failure_injected')} events")
-    print("Failure Recovery Probability,not measured; requires many failure trials")
-    if effective_ratio is None:
-        print("Effective Training Time Ratio,not available")
-    else:
-        print(f"Effective Training Time Ratio,{effective_ratio:.6f}")
-    print("Scalability with Cluster Size,not measured; compare multiple cluster sizes")
-    print("Traffic Interleaving Effectiveness,compare sync and --async_save runs")
-    print("Checkpoint Serialization Overhead,checkpoint_snapshot approximates it")
-    print("Failure Detection Time,not measured by this local worker")
-    print("Recovery Startup/Warmup Time,use checkpoint_resume_load and resume_loaded")
+    print_table(["metric", "result"], rows)
 
 
 def main():
